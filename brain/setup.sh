@@ -8,6 +8,9 @@ echo
 echo "== Setting up Jarvis's brain. This takes about 10 minutes. =="
 echo
 
+# Android sometimes wipes Termux's download cache; recreate it so apt can work.
+mkdir -p /data/data/com.termux/cache/apt/archives/partial
+
 apt-get update -y
 apt-get -y -o Dpkg::Options::="--force-confnew" upgrade
 apt-get install -y proot-distro curl
