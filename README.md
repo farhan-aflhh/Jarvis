@@ -20,7 +20,7 @@ Don't use the Play Store version, which is outdated.
 Open Termux and paste:
 
 ```
-pkg install -y curl && curl -fsSL https://raw.githubusercontent.com/farhan-aflhh/jarvis/main/brain/setup.sh | bash
+apt update && apt full-upgrade -y -o Dpkg::Options::=--force-confnew && apt install -y curl && curl -fsSL https://raw.githubusercontent.com/farhan-aflhh/jarvis/main/brain/setup.sh | bash
 ```
 
 Wait about 10 minutes. If it asks a question, press Enter.
