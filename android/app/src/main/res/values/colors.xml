@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0B0B0D</color>
+    <color name="panel">#141417</color>
+    <color name="line">#2A2722</color>
+    <color name="gold">#C9A45C</color>
+    <color name="gold_dim">#8C7346</color>
+    <color name="ink">#ECE6D8</color>
+    <color name="muted">#8D877B</color>
+</resources>
