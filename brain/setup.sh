@@ -25,11 +25,10 @@ export DEBIAN_FRONTEND=noninteractive
 export PATH="$HOME/.local/bin:$PATH"
 apt-get update -y
 apt-get install -y curl git ca-certificates tzdata python3 python3-pip
-pip3 install --break-system-packages -q --upgrade requests icalendar recurring-ical-events tzdata
 rm -rf /root/jarvis-src
 git clone --depth 1 https://github.com/farhan-aflhh/jarvis /root/jarvis-src
-mkdir -p /root/jarvis
-cp /root/jarvis-src/brain/server.py /root/jarvis-src/brain/persona.md /root/jarvis/
+rm -f /root/jarvis/.req
+bash /root/jarvis-src/brain/install.sh
 if ! claude --version >/dev/null 2>&1; then
   curl -fsSL https://claude.ai/install.sh | bash || true
 fi
@@ -46,7 +45,16 @@ proot-distro login ubuntu -- bash -c "$INNER"
 cat > "$PREFIX/bin/jarvis" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 termux-wake-lock 2>/dev/null || true
-exec proot-distro login ubuntu -- bash -c 'export PATH="$HOME/.local/bin:$PATH"; cd /root/jarvis && python3 -u server.py'
+exec proot-distro login ubuntu -- bash -c '
+export PATH="$HOME/.local/bin:$PATH"
+echo "Checking for Jarvis updates..."
+if git -C /root/jarvis-src fetch -q --depth 1 origin main 2>/dev/null; then
+  git -C /root/jarvis-src reset -q --hard FETCH_HEAD
+  bash /root/jarvis-src/brain/install.sh || echo "(update step failed, starting the current version)"
+else
+  echo "(offline, starting the current version)"
+fi
+cd /root/jarvis && exec python3 -u server.py'
 EOF
 
 cat > "$PREFIX/bin/jarvis-login" <<'EOF'

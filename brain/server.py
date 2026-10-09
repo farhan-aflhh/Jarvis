@@ -2,7 +2,10 @@
 Jarvis brain. Runs on your phone inside Termux (Ubuntu) and thinks with your
 Claude Pro plan through Claude Code. The Jarvis app talks to it on 127.0.0.1.
 """
+import asyncio
+import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -14,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import edge_tts
 import icalendar
 import recurring_ical_events
 import requests
@@ -22,11 +26,22 @@ TIMEZONE = "Asia/Kolkata"
 TZ = ZoneInfo(TIMEZONE)
 PORT = 8765
 CLAUDE_MODEL = "sonnet"
+# His voice. British male neural voices: en-GB-RyanNeural (warm), en-GB-ThomasNeural (crisper).
+VOICE = "en-GB-RyanNeural"
+VOICE_RATE = "-4%"
+VOICE_PITCH = "-3Hz"
 
 HERE = Path(__file__).resolve().parent
 SESSION_FILE = HERE / ".session"
 REPORTS = HERE / "reports"
 CODE_FILE = HERE / "code.txt"
+VOICE_CACHE = HERE / "voice_cache"
+# Short lines the app says while he thinks. Pre-recorded at startup so they play instantly.
+ACKS = [
+    "Right away, sir.", "On it.", "Leave it with me.", "One moment, sir.",
+    "Consider it handled.", "Very good, sir.", "Allow me.",
+    "I didn't quite catch that, sir.",
+]
 LOCK = threading.Lock()  # one conversation, one turn at a time
 
 
@@ -47,6 +62,46 @@ def find_claude() -> str | None:
         return found
     local = Path.home() / ".local" / "bin" / "claude"
     return str(local) if local.exists() else None
+
+
+# ------------------------------------------------------------------ VOICE
+def synth(text: str) -> bytes | None:
+    """Speak text in his voice (free Microsoft neural voice). Short lines are cached."""
+    text = text.strip()
+    if not text:
+        return None
+    key = hashlib.sha1(f"{VOICE}|{VOICE_RATE}|{VOICE_PITCH}|{text}".encode()).hexdigest()
+    cached = VOICE_CACHE / f"{key}.mp3"
+    if cached.exists():
+        return cached.read_bytes()
+
+    async def run() -> bytes:
+        out = bytearray()
+        comm = edge_tts.Communicate(text, VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH)
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                out += chunk["data"]
+        return bytes(out)
+
+    try:
+        audio = asyncio.run(asyncio.wait_for(run(), timeout=40))
+    except Exception as e:
+        print(f"(voice unavailable, the phone's own voice will be used: {e})", flush=True)
+        return None
+    if audio and len(text) <= 120:
+        VOICE_CACHE.mkdir(exist_ok=True)
+        cached.write_bytes(audio)
+    return audio or None
+
+
+def synth_b64(text: str) -> str | None:
+    audio = synth(text)
+    return base64.b64encode(audio).decode() if audio else None
+
+
+def warm_voice_cache() -> None:
+    for line in ACKS:
+        synth(line)
 
 
 # ------------------------------------------------------------------ CALENDAR
@@ -170,6 +225,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/reset":
             SESSION_FILE.unlink(missing_ok=True)
             return self._send(200, {"ok": True})
+        if self.path == "/say":
+            return self._send(200, {"audio": synth_b64(str(data.get("text", "")))})
         if self.path != "/ask":
             return self._send(404, {"error": "not found"})
 
@@ -186,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             (REPORTS / f"{dt.datetime.now(TZ):%Y-%m-%d_%H%M%S}.md").write_text(report, encoding="utf-8")
         spoken = for_voice(spoken) or "Done, sir."
         print(f"< {spoken}\n", flush=True)
-        self._send(200, {"reply": spoken, "report": report})
+        self._send(200, {"reply": spoken, "report": report, "audio": synth_b64(spoken)})
 
     def log_message(self, *args):
         pass
@@ -198,6 +255,7 @@ def main() -> None:
     if not find_claude():
         print("  Warning: Claude Code not found. Run jarvis-setup again.")
     print("  Leave this running. Close it with Ctrl+C.\n", flush=True)
+    threading.Thread(target=warm_voice_cache, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 

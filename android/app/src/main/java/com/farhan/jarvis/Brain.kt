@@ -1,5 +1,6 @@
 package com.farhan.jarvis
 
+import android.util.Base64
 import org.json.JSONObject
 import java.io.IOException
 import java.net.ConnectException
@@ -10,7 +11,8 @@ import java.net.URL
 object Brain {
     private const val BASE = "http://127.0.0.1:8765"
 
-    data class Answer(val reply: String, val report: String)
+    /** audio is his recorded voice (mp3), or null to fall back to the phone's own voice. */
+    data class Answer(val reply: String, val report: String, val audio: ByteArray? = null)
 
     private class WrongCode : Exception()
 
@@ -21,7 +23,7 @@ object Brain {
         if (calls != null) body.put("calls", calls)
         return try {
             val json = post("/ask", prefs.brainCode, body, 900_000)
-            Answer(json.optString("reply", "Done, sir."), json.optString("report", ""))
+            Answer(json.optString("reply", "Done, sir."), json.optString("report", ""), decode(json))
         } catch (e: ConnectException) {
             Answer("My brain isn't running, sir. Open Termux and type jarvis.", "")
         } catch (e: WrongCode) {
@@ -29,6 +31,19 @@ object Brain {
         } catch (e: Exception) {
             Answer("I've lost the uplink, sir. ${e.message ?: ""}".take(160), "")
         }
+    }
+
+    /** His voice for a line of text, or null if the brain or voice service can't be reached. */
+    fun say(prefs: Prefs, text: String): ByteArray? = try {
+        decode(post("/say", prefs.brainCode, JSONObject().put("text", text), 45_000))
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun decode(json: JSONObject): ByteArray? {
+        val b64 = json.optString("audio", "")
+        if (b64.isBlank() || b64 == "null") return null
+        return try { Base64.decode(b64, Base64.DEFAULT) } catch (e: IllegalArgumentException) { null }
     }
 
     fun reset(prefs: Prefs): Boolean = try {
