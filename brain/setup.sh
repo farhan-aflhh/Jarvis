@@ -15,10 +15,8 @@ apt-get update -y
 apt-get -y -o Dpkg::Options::="--force-confnew" upgrade
 apt-get install -y proot-distro curl
 
-# Install Ubuntu only if it isn't there yet (newer proot-distro keeps it in a different folder).
-if ! proot-distro login ubuntu -- true >/dev/null 2>&1; then
-  proot-distro install ubuntu
-fi
+# Install Ubuntu. If it's already there, proot-distro says so and we carry on.
+proot-distro install ubuntu </dev/null || echo "(Ubuntu is already installed, carrying on.)"
 
 INNER=$(cat <<'EOF'
 set -e
@@ -41,7 +39,7 @@ fi
 echo "Claude Code: $(claude --version)"
 EOF
 )
-proot-distro login ubuntu -- bash -c "$INNER"
+proot-distro login ubuntu -- bash -c "$INNER" </dev/null
 
 cat > "$PREFIX/bin/jarvis" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
