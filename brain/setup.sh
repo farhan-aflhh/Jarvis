@@ -15,7 +15,8 @@ apt-get update -y
 apt-get -y -o Dpkg::Options::="--force-confnew" upgrade
 apt-get install -y proot-distro curl
 
-if [ ! -d "$PREFIX/var/lib/proot-distro/installed-rootfs/ubuntu" ]; then
+# Install Ubuntu only if it isn't there yet (newer proot-distro keeps it in a different folder).
+if ! proot-distro login ubuntu -- true >/dev/null 2>&1; then
   proot-distro install ubuntu
 fi
 
