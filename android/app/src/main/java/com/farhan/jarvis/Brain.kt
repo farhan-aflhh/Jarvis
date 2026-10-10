@@ -18,6 +18,7 @@ object Brain {
         val audio: ByteArray? = null,
         val spoken: Boolean = false,    // true when the sentences were already handed over to be spoken
         val cancelled: Boolean = false, // true when he was interrupted
+        val pdf: String? = null,        // file name of a PDF the brain made
     )
 
     @Volatile private var live: HttpURLConnection? = null
@@ -54,6 +55,7 @@ object Brain {
             }
             var reply = ""
             var report = ""
+            var pdf: String? = null
             var any = false
             val reader = c.inputStream.bufferedReader()
             while (true) {
@@ -67,9 +69,10 @@ object Brain {
                 if (j.optBoolean("done")) {
                     reply = j.optString("reply", "")
                     report = j.optString("report", "")
+                    pdf = j.optString("pdf", "").takeIf { it.isNotBlank() && it != "null" }
                 }
             }
-            if (cancelled) Answer("", "", cancelled = true) else Answer(reply, report, spoken = any)
+            if (cancelled) Answer("", "", cancelled = true) else Answer(reply, report, spoken = any, pdf = pdf)
         } catch (e: ConnectException) {
             Answer("My brain isn't running, sir. Open Termux and type jarvis.", "")
         } catch (e: Exception) {
@@ -90,7 +93,10 @@ object Brain {
         if (calls != null) body.put("calls", calls)
         return try {
             val json = post("/ask", prefs.brainCode, body, 900_000)
-            Answer(json.optString("reply", "Done, sir."), json.optString("report", ""), decode(json))
+            Answer(
+                json.optString("reply", "Done, sir."), json.optString("report", ""), decode(json),
+                pdf = json.optString("pdf", "").takeIf { it.isNotBlank() && it != "null" },
+            )
         } catch (e: ConnectException) {
             Answer("My brain isn't running, sir. Open Termux and type jarvis.", "")
         } catch (e: WrongCode) {
@@ -98,6 +104,21 @@ object Brain {
         } catch (e: Exception) {
             Answer("I've lost the uplink, sir. ${e.message ?: ""}".take(160), "")
         }
+    }
+
+    /** Fetch a PDF the brain made. */
+    fun download(prefs: Prefs, name: String): ByteArray? = try {
+        val c = URL("$BASE/file/" + java.net.URLEncoder.encode(name, "UTF-8")).openConnection() as HttpURLConnection
+        try {
+            c.connectTimeout = 4_000
+            c.readTimeout = 60_000
+            c.setRequestProperty("X-Jarvis-Code", prefs.brainCode)
+            if (c.responseCode == 200) c.inputStream.use { it.readBytes() } else null
+        } finally {
+            c.disconnect()
+        }
+    } catch (e: Exception) {
+        null
     }
 
     /** His voice for a line of text, or null if the brain or voice service can't be reached. */

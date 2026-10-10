@@ -19,6 +19,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import edge_tts
+
+import pdfmaker
 import icalendar
 import recurring_ical_events
 import requests
@@ -383,10 +385,23 @@ def for_voice(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def save_report(report: str) -> None:
-    if report:
-        REPORTS.mkdir(exist_ok=True)
-        (REPORTS / f"{dt.datetime.now(TZ):%Y-%m-%d_%H%M%S}.md").write_text(report, encoding="utf-8")
+def save_report(report: str) -> str | None:
+    """Saves the report and turns it into a PDF. Returns the PDF's file name, or None."""
+    if not report:
+        return None
+    now = dt.datetime.now(TZ)
+    REPORTS.mkdir(exist_ok=True)
+    (REPORTS / f"{now:%Y-%m-%d_%H%M%S}.md").write_text(report, encoding="utf-8")
+    try:
+        path = pdfmaker.make_pdf(report, REPORTS, now)
+        print(f"  (PDF ready: {path.name})", flush=True)
+        return path.name
+    except Exception as e:
+        print(f"  (PDF failed: {e})", flush=True)
+        return None
+
+
+SAFE_NAME = re.compile(r"^[\w.-]+\.pdf$")
 
 
 # ------------------------------------------------------------------ HTTP
@@ -402,6 +417,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/ping":
             return self._send(200, {"ok": True})
+        if self.path.startswith("/file/"):
+            given = self.headers.get("X-Jarvis-Code", "").encode()
+            if not secrets.compare_digest(given, CODE.encode()):
+                return self._send(401, {"error": "wrong brain code"})
+            name = self.path[len("/file/"):]
+            path = REPORTS / name
+            if not SAFE_NAME.match(name) or not path.is_file():
+                return self._send(404, {"error": "no such file"})
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -433,10 +463,11 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 reply = apply_memory(ask_claude(text, calls, ics_url))
             spoken, _, report = reply.partition(Sentences.MARKER)
-            save_report(report.strip())
+            pdf = save_report(report.strip())
             spoken = for_voice(spoken) or "Done, sir."
             print(f"< {spoken}\n", flush=True)
-            return self._send(200, {"reply": spoken, "report": report.strip(), "audio": synth_b64(spoken)})
+            return self._send(200, {"reply": spoken, "report": report.strip(), "pdf": pdf,
+                                    "audio": synth_b64(spoken)})
 
         # Streaming: one JSON line per sentence, in his voice, as soon as it's ready.
         self.send_response(200)
@@ -487,9 +518,13 @@ class Handler(BaseHTTPRequestHandler):
                 finished[0] = True
                 cond.notify()
             voice_thread.join()
-        save_report(report)
+        pdf = save_report(report)
+        if report and not pdf:
+            sorry = "I'm afraid the PDF wouldn't print, sir. The full report is on your screen."
+            print(f"< {sorry}", flush=True)
+            write({"say": sorry, "audio": synth_b64(sorry)})
         print(flush=True)
-        write({"done": True, "reply": spoken, "report": report})
+        write({"done": True, "reply": spoken, "report": report, "pdf": pdf})
 
     def log_message(self, *args):
         pass

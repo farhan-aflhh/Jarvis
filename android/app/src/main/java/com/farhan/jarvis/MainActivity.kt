@@ -24,6 +24,7 @@ class MainActivity : Activity() {
     private lateinit var reply: TextView
     private lateinit var reportLabel: TextView
     private lateinit var report: TextView
+    private lateinit var pdfRow: View
     private lateinit var input: EditText
     private var pending: (() -> Unit)? = null
 
@@ -38,6 +39,19 @@ class MainActivity : Activity() {
         reply = findViewById(R.id.reply)
         reportLabel = findViewById(R.id.reportLabel)
         report = findViewById(R.id.report)
+        pdfRow = findViewById(R.id.pdfRow)
+        findViewById<Button>(R.id.openPdf).setOnClickListener {
+            JarvisState.pdfUri?.let { uri ->
+                try {
+                    startActivity(Reports.openIntent(uri))
+                } catch (e: Exception) {
+                    toast("No PDF viewer found. It's saved in Downloads › Jarvis.")
+                }
+            }
+        }
+        findViewById<Button>(R.id.sharePdf).setOnClickListener {
+            JarvisState.pdfUri?.let { uri -> startActivity(Reports.shareIntent(uri, JarvisState.pdfTitle)) }
+        }
         input = findViewById(R.id.input)
 
         val accessKey = findViewById<EditText>(R.id.accessKey)
@@ -119,6 +133,7 @@ class MainActivity : Activity() {
         reportLabel.visibility = if (hasReport) View.VISIBLE else View.GONE
         report.visibility = if (hasReport) View.VISIBLE else View.GONE
         report.text = JarvisState.report
+        pdfRow.visibility = if (JarvisState.pdfUri != null) View.VISIBLE else View.GONE
     }
 
     private fun sendTyped() {

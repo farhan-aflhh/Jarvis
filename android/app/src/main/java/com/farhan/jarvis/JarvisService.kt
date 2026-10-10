@@ -347,7 +347,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 }
             }
             if (answer.cancelled || myTurn != turn) return@execute
-            if (answer.report.isNotBlank()) JarvisState.update { report = answer.report }
+            if (answer.report.isNotBlank()) JarvisState.update { report = answer.report; pdfUri = null }
             if (!answer.spoken) {
                 JarvisState.update { reply = answer.reply }
                 say(Kind.SENTENCE, answer.reply, answer.audio, fetch = answer.audio == null, forTurn = myTurn)
@@ -355,7 +355,17 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 JarvisState.update { reply = answer.reply }
             }
             say(Kind.END, "", forTurn = myTurn)
+            answer.pdf?.let { deliverPdf(it, answer.report) }
         }
+    }
+
+    /** Bring the PDF over from the brain, save it to Downloads › Jarvis, and let him know. */
+    private fun deliverPdf(name: String, report: String) {
+        val bytes = Brain.download(prefs, name) ?: return
+        val uri = Reports.save(this, name, bytes) ?: return
+        val title = Reports.titleOf(report)
+        JarvisState.update { pdfUri = uri; pdfTitle = title }
+        Reports.notifyReady(this, uri, title)
     }
 
     private fun pickFiller(): String {

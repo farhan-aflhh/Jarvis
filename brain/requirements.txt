@@ -3,3 +3,4 @@ icalendar
 recurring-ical-events
 tzdata
 edge-tts
+markdown

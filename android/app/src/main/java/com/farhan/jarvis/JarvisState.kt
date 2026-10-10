@@ -10,6 +10,8 @@ object JarvisState {
     var heard = ""
     var reply = ""
     var report = ""
+    var pdfUri: android.net.Uri? = null
+    var pdfTitle = ""
     var listener: (() -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
