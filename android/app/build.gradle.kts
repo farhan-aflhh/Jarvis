@@ -11,8 +11,8 @@ android {
         applicationId = "com.farhan.jarvis"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     // A fixed key so new builds install over old ones without uninstalling.

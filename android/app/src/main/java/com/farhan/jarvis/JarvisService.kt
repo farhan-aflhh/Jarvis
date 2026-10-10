@@ -32,8 +32,9 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
- * Keeps Jarvis alive in the background: listens for "Jarvis", hears the request,
- * asks the brain, and speaks the answer.
+ * Keeps Jarvis alive in the background and runs the conversation:
+ * hears "Jarvis", listens, asks the brain, speaks the answer sentence by sentence,
+ * then keeps listening for a follow-up. Saying "Jarvis" while he talks interrupts him.
  */
 class JarvisService : Service(), TextToSpeech.OnInitListener {
 
@@ -46,12 +47,24 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         const val EXTRA_TEXT = "text"
         private const val CHANNEL = "jarvis"
         private const val NOTIFICATION_ID = 7
+
         // Keep in step with ACKS in brain/server.py, which pre-records these in his voice.
-        private val ACKS = listOf(
-            "Right away, sir.", "On it.", "Leave it with me.", "One moment, sir.",
-            "Consider it handled.", "Very good, sir.", "Allow me.",
+        private val FILLERS = listOf(
+            "Mm, one moment.", "Let me see.", "Right, leave it with me.", "Bear with me, sir.",
+            "On it.", "Ah, let me check.", "One moment, sir.", "Allow me.",
         )
+        private val STILL_WORKING = listOf("Still on it, sir.", "Nearly there, sir.")
+        private val SIGN_OFFS = listOf("My pleasure, sir.", "Always, sir.", "Very good, sir.", "Any time, sir.")
+        private const val NOT_CAUGHT = "I didn't quite catch that, sir."
+
         private val CALL_WORDS = Regex("\\b(call|calls|called|calling|missed|rang|ring|phone|dial)", RegexOption.IGNORE_CASE)
+        private val WRAP_UP = Regex(
+            "^(ok(ay)?,? |alright,? )?(thanks|thank you|thank you so much|cheers|that's all|that's it|that'll be all|" +
+                "nothing|nothing else|no|nope|no thanks|no thank you|bye|goodbye|good night|stop|never mind|" +
+                "all good|i'm good|we're done|done)( jarvis| sir| mate)?[.!]*$",
+            RegexOption.IGNORE_CASE,
+        )
+        private const val STILL_WORKING_AFTER_MS = 14_000L
 
         fun send(context: Context, action: String, text: String? = null) {
             val i = Intent(context, JarvisService::class.java).setAction(action)
@@ -62,16 +75,25 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
-    private val voiceExec = Executors.newSingleThreadExecutor() // fetches his voice, in order
+    private val voiceExec = Executors.newSingleThreadExecutor() // gets his voice, strictly in order
     private lateinit var prefs: Prefs
     private var porcupine: PorcupineManager? = null
+    private var wakeActive = false
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var busy = false
     private var tone: ToneGenerator? = null
 
-    private class Line(val id: String, val text: String, val audio: ByteArray?)
+    // Conversation state
+    @Volatile private var turn = 0               // bumps on every new request or interruption; stale audio is dropped
+    private var busy = false           // listening, thinking or speaking
+    private var followUp = false       // listening for a reply without the wake word
+    private var replyStarted = false   // the current answer has begun playing
+    private var lastFiller = ""
+
+    // Speech queue
+    private class Line(val kind: Kind, val text: String, val audio: ByteArray?, val turn: Int, val keepTalking: Boolean = true)
+    private enum class Kind { FILLER, SENTENCE, END }
     private val queue = ArrayDeque<Line>()
     private var playing = false
     private var player: MediaPlayer? = null
@@ -81,7 +103,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
-        tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 70) } catch (e: RuntimeException) { null }
+        tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 60) } catch (e: RuntimeException) { null }
         tts = TextToSpeech(this, this)
         JarvisState.update { running = true }
     }
@@ -98,13 +120,13 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_LISTEN -> beginListening()
-            ACTION_ASK -> intent.getStringExtra(EXTRA_TEXT)?.let { handle(it) }
+            ACTION_LISTEN -> { interrupt(); beginListening(followUp = false) }
+            ACTION_ASK -> intent.getStringExtra(EXTRA_TEXT)?.let { interrupt(); handle(it) }
             ACTION_RELOAD -> {
                 releaseWakeWord()
-                wakeOn()
+                if (!busy) standBy()
             }
-            else -> wakeOn() // ACTION_START, or Android restarting us
+            else -> if (!busy) standBy() // ACTION_START, or Android restarting us
         }
         return START_STICKY
     }
@@ -155,22 +177,26 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun wakeOn() {
-        if (busy) return
-        if (!ensureWakeWord()) return
-        try {
+    private fun wakeOn(): Boolean {
+        if (wakeActive) return true
+        if (!ensureWakeWord()) return false
+        return try {
             porcupine?.start()
-            setStatus("Standing by. Say \"Jarvis\".")
+            wakeActive = true
+            true
         } catch (e: PorcupineException) {
             setStatus("Wake word couldn't start: ${e.message}")
+            false
         }
     }
 
     private fun wakeOff() {
+        if (!wakeActive) return
         try {
             porcupine?.stop()
         } catch (_: PorcupineException) {
         }
+        wakeActive = false
     }
 
     private fun releaseWakeWord() {
@@ -179,18 +205,41 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         porcupine = null
     }
 
+    /** Back to waiting for "Jarvis". */
+    private fun standBy() {
+        busy = false
+        followUp = false
+        if (wakeOn()) setStatus("Standing by. Say \"Jarvis\".")
+    }
+
     private fun onWake() {
-        if (!busy) beginListening()
+        // Heard "Jarvis": either a fresh request, or he's interrupting me mid-sentence.
+        interrupt()
+        beginListening(followUp = false)
+    }
+
+    /** Stop whatever I'm saying or working on, and drop anything still on its way. */
+    private fun interrupt() {
+        turn++
+        Brain.cancel()
+        stopSpeaking()
+        recognizer?.cancel()
     }
 
     // ---------------------------------------------------------------- listening
-    private fun beginListening() {
+    private fun beginListening(followUp: Boolean) {
         busy = true
-        wakeOff()
-        stopSpeaking()
-        tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 150)
-        setStatus("Listening…")
-        main.postDelayed({ startRecognizer() }, 300)
+        this.followUp = followUp
+        wakeOff() // the mic can only be used by one listener at a time
+        if (followUp) {
+            tone?.startTone(ToneGenerator.TONE_PROP_ACK, 60)
+            setStatus("Listening… (just reply, no need to say Jarvis)")
+        } else {
+            tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 120)
+            setStatus("Listening…")
+        }
+        val myTurn = turn
+        main.postDelayed({ if (myTurn == turn) startRecognizer() }, 250)
     }
 
     private fun startRecognizer() {
@@ -199,90 +248,181 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             return
         }
         val r = recognizer ?: SpeechRecognizer.createSpeechRecognizer(this).also { recognizer = it }
+        val myTurn = turn
         r.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle?) {
+                if (myTurn != turn) return
                 val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
-                if (text.isBlank()) finishWith("I didn't quite catch that, sir.") else handle(text)
+                when {
+                    text.isNotBlank() -> handle(text)
+                    followUp -> standBy()
+                    else -> finishWith(NOT_CAUGHT)
+                }
             }
 
             override fun onError(error: Int) {
+                if (myTurn != turn) return
+                if (followUp) {
+                    standBy() // silence after an answer just means the conversation's over
+                    return
+                }
                 when (error) {
-                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
-                        finishWith("I didn't quite catch that, sir.")
+                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> finishWith(NOT_CAUGHT)
                     SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
                         finishWith("No signal for my ears, sir. Check the internet.")
-                    else -> finishWith("My hearing's gone fuzzy, sir. Error $error.")
+                    SpeechRecognizer.ERROR_CLIENT -> standBy()
+                    else -> finishWith("My hearing's gone a bit fuzzy, sir. Do try again.")
                 }
             }
 
             override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
+            override fun onBeginningOfSpeech() { setStatus("Listening…") }
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() { setStatus("Thinking…") }
-            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!partial.isNullOrBlank() && myTurn == turn) JarvisState.update { heard = partial }
+            }
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
             .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         r.startListening(intent)
     }
 
     // ---------------------------------------------------------------- thinking
     private fun handle(text: String) {
+        turn++
+        val myTurn = turn
         busy = true
+        followUp = false
+        replyStarted = false
         wakeOff()
         JarvisState.update { heard = text; reply = "…" }
-        setStatus("Working on it…")
-        say(ACKS.random(), "ack")
+
+        // "Thanks", "that's all": a quick sign-off, then back to standing by.
+        if (WRAP_UP.matches(text.trim())) {
+            val bye = SIGN_OFFS.random()
+            JarvisState.update { reply = bye }
+            say(Kind.SENTENCE, bye)
+            say(Kind.END, "", keepTalking = false)
+            return
+        }
+
+        setStatus("Thinking… (say \"Jarvis\" to cancel)")
+        wakeOn() // he can still cut in with "Jarvis" while I think
+        say(Kind.FILLER, pickFiller())
+        main.postDelayed({
+            if (myTurn == turn && !replyStarted) say(Kind.FILLER, STILL_WORKING.random())
+        }, STILL_WORKING_AFTER_MS)
+
         worker.execute {
+            if (myTurn != turn) return@execute
             val calls = if (CALL_WORDS.containsMatchIn(text)) CallLogReader.recent(this) else null
-            val answer = Brain.ask(prefs, text, calls)
-            JarvisState.update {
-                reply = answer.reply
-                if (answer.report.isNotBlank()) report = answer.report
+            var shown = ""
+            val answer = Brain.askStream(prefs, text, calls) { sentence, audio ->
+                if (myTurn == turn) {
+                    shown = if (shown.isEmpty()) sentence else "$shown $sentence"
+                    val soFar = shown
+                    JarvisState.update { reply = soFar }
+                    say(Kind.SENTENCE, sentence, audio, fetch = false, forTurn = myTurn)
+                }
             }
-            say(answer.reply, "reply", answer.audio, fetch = false)
+            if (answer.cancelled || myTurn != turn) return@execute
+            if (answer.report.isNotBlank()) JarvisState.update { report = answer.report }
+            if (!answer.spoken) {
+                JarvisState.update { reply = answer.reply }
+                say(Kind.SENTENCE, answer.reply, answer.audio, fetch = answer.audio == null, forTurn = myTurn)
+            } else if (answer.reply.isNotBlank()) {
+                JarvisState.update { reply = answer.reply }
+            }
+            say(Kind.END, "", forTurn = myTurn)
         }
     }
 
+    private fun pickFiller(): String {
+        val f = FILLERS.filter { it != lastFiller }.random()
+        lastFiller = f
+        return f
+    }
+
+    /** Say something that isn't an answer (errors), then stand by. */
     private fun finishWith(message: String) {
+        turn++
+        busy = true
+        replyStarted = false
         JarvisState.update { reply = message }
-        say(message, "reply")
+        say(Kind.SENTENCE, message)
+        say(Kind.END, "", keepTalking = false)
     }
 
     // ---------------------------------------------------------------- speaking
     // His real voice comes from the brain (a natural British male neural voice).
     // If that can't be reached, the phone's own text-to-speech steps in, set to a male voice.
 
-    /** Queue a line. Lines always play in the order they were asked for. */
-    private fun say(text: String, id: String, audio: ByteArray? = null, fetch: Boolean = true) {
+    /** Queue a line for the current turn. Lines always play in the order they were asked for. */
+    private fun say(
+        kind: Kind,
+        text: String,
+        audio: ByteArray? = null,
+        fetch: Boolean = true,
+        keepTalking: Boolean = true,
+        forTurn: Int = turn,
+    ) {
         voiceExec.execute {
-            val sound = audio ?: if (fetch) Brain.say(prefs, text) else null
+            if (forTurn != turn) return@execute
+            val sound = if (kind == Kind.END) null else audio ?: if (fetch) Brain.say(prefs, text) else null
             main.post {
-                queue.addLast(Line(id, text, sound))
+                if (forTurn != turn) return@post
+                queue.addLast(Line(kind, text, sound, forTurn, keepTalking))
                 if (!playing) playNext()
             }
         }
     }
 
     private fun playNext() {
-        val line = queue.removeFirstOrNull()
-        if (line == null) {
-            playing = false
+        while (true) {
+            val line = queue.removeFirstOrNull()
+            if (line == null) {
+                playing = false
+                return
+            }
+            if (line.turn != turn) continue
+            if (line.kind == Kind.END) {
+                playing = false
+                turnFinished(line)
+                return
+            }
+            if (line.kind == Kind.FILLER && replyStarted) continue // the answer's here; skip late fillers
+            playing = true
+            if (line.kind == Kind.SENTENCE && !replyStarted) {
+                replyStarted = true
+                setStatus("Speaking… (say \"Jarvis\" to interrupt)")
+                wakeOn() // listen for "Jarvis" while I talk, so he can cut in
+            }
+            if (line.audio == null || !playAudio(line)) speakFallback(line)
             return
         }
-        playing = true
-        if (line.id == "reply") setStatus("Speaking…")
-        if (line.audio == null || !playAudio(line)) speakFallback(line)
+    }
+
+    private fun turnFinished(line: Line) {
+        wakeOff()
+        if (line.keepTalking) {
+            // Keep the conversation going: listen for a reply without the wake word.
+            beginListening(followUp = true)
+        } else {
+            standBy()
+        }
     }
 
     private fun playAudio(line: Line): Boolean {
         var mp: MediaPlayer? = null
         return try {
-            val file = File(cacheDir, "line_${fileCounter++ % 4}.mp3")
+            val file = File(cacheDir, "line_${fileCounter++ % 6}.mp3")
             file.writeBytes(line.audio!!)
             mp = MediaPlayer()
             mp.setAudioAttributes(
@@ -294,13 +434,17 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             mp.setDataSource(file.path)
             mp.setOnCompletionListener {
                 it.release()
-                if (player === it) player = null
-                lineDone(line)
+                if (player === it) {
+                    player = null
+                    playNext()
+                }
             }
             mp.setOnErrorListener { m, _, _ ->
                 m.release()
-                if (player === m) player = null
-                speakFallback(line)
+                if (player === m) {
+                    player = null
+                    speakFallback(line)
+                }
                 true
             }
             mp.prepare()
@@ -316,16 +460,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private fun speakFallback(line: Line) {
         val t = tts
         if (!ttsReady || t == null) {
-            lineDone(line)
+            playNext()
             return
         }
         fallbackLine = line
         t.speak(line.text, TextToSpeech.QUEUE_FLUSH, null, "fallback")
-    }
-
-    private fun lineDone(line: Line) {
-        playNext()
-        if (line.id == "reply" && !playing) doneSpeaking()
     }
 
     private fun stopSpeaking() {
@@ -355,9 +494,9 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             override fun onError(utteranceId: String?) = finished()
             private fun finished() {
                 main.post {
-                    val line = fallbackLine ?: return@post
+                    if (fallbackLine == null) return@post
                     fallbackLine = null
-                    lineDone(line)
+                    playNext()
                 }
             }
         })
@@ -376,15 +515,12 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             ?: english.firstOrNull { isMale(it) }
     }
 
-    private fun doneSpeaking() {
-        busy = false
-        wakeOn()
-    }
-
     private fun setStatus(s: String) = JarvisState.update { status = s }
 
     // ---------------------------------------------------------------- shutdown
     override fun onDestroy() {
+        turn++
+        Brain.cancel()
         releaseWakeWord()
         recognizer?.destroy()
         stopSpeaking()

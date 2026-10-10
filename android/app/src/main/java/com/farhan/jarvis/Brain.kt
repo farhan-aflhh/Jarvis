@@ -12,7 +12,74 @@ object Brain {
     private const val BASE = "http://127.0.0.1:8765"
 
     /** audio is his recorded voice (mp3), or null to fall back to the phone's own voice. */
-    data class Answer(val reply: String, val report: String, val audio: ByteArray? = null)
+    data class Answer(
+        val reply: String,
+        val report: String,
+        val audio: ByteArray? = null,
+        val spoken: Boolean = false,    // true when the sentences were already handed over to be spoken
+        val cancelled: Boolean = false, // true when he was interrupted
+    )
+
+    @Volatile private var live: HttpURLConnection? = null
+    @Volatile private var cancelled = false
+
+    /** Stop the answer in progress (he was interrupted). */
+    fun cancel() {
+        cancelled = true
+        live?.let { c -> Thread { c.disconnect() }.start() }
+    }
+
+    /**
+     * Ask, and hand over each sentence (with his voice) the moment it's ready.
+     * Falls back to the whole-answer call if the brain is an older version.
+     */
+    fun askStream(prefs: Prefs, text: String, calls: String?, onSentence: (String, ByteArray?) -> Unit): Answer {
+        cancelled = false
+        val body = JSONObject().put("text", text).put("ics_url", prefs.icsUrl)
+        if (calls != null) body.put("calls", calls)
+        val c = URL("$BASE/ask_stream").openConnection() as HttpURLConnection
+        live = c
+        return try {
+            c.requestMethod = "POST"
+            c.connectTimeout = 4_000
+            c.readTimeout = 900_000
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.setRequestProperty("X-Jarvis-Code", prefs.brainCode)
+            c.outputStream.use { it.write(body.toString().toByteArray()) }
+            when (val status = c.responseCode) {
+                401 -> return Answer("The brain code doesn't match, sir. Check it in settings.", "")
+                404 -> return ask(prefs, text, calls).also { onSentence(it.reply, it.audio) }.copy(spoken = true)
+                !in 200..299 -> return Answer("I've lost the uplink, sir. Error $status.", "")
+            }
+            var reply = ""
+            var report = ""
+            var any = false
+            val reader = c.inputStream.bufferedReader()
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isBlank()) continue
+                val j = JSONObject(line)
+                if (j.has("say")) {
+                    any = true
+                    onSentence(j.getString("say"), decode(j))
+                }
+                if (j.optBoolean("done")) {
+                    reply = j.optString("reply", "")
+                    report = j.optString("report", "")
+                }
+            }
+            if (cancelled) Answer("", "", cancelled = true) else Answer(reply, report, spoken = any)
+        } catch (e: ConnectException) {
+            Answer("My brain isn't running, sir. Open Termux and type jarvis.", "")
+        } catch (e: Exception) {
+            if (cancelled) Answer("", "", cancelled = true)
+            else Answer("I've lost the uplink, sir. ${e.message ?: ""}".take(160), "")
+        } finally {
+            c.disconnect()
+            if (live === c) live = null
+        }
+    }
 
     private class WrongCode : Exception()
 

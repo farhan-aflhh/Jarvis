@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,11 +37,20 @@ SESSION_FILE = HERE / ".session"
 REPORTS = HERE / "reports"
 CODE_FILE = HERE / "code.txt"
 VOICE_CACHE = HERE / "voice_cache"
-# Short lines the app says while he thinks. Pre-recorded at startup so they play instantly.
+# Short lines the app speaks itself (fillers while he thinks, sign-offs, errors).
+# Pre-recorded at startup so they play instantly. Keep in step with the app's lists.
 ACKS = [
-    "Right away, sir.", "On it.", "Leave it with me.", "One moment, sir.",
-    "Consider it handled.", "Very good, sir.", "Allow me.",
+    # fillers
+    "Mm, one moment.", "Let me see.", "Right, leave it with me.", "Bear with me, sir.",
+    "On it.", "Ah, let me check.", "One moment, sir.", "Allow me.",
+    # still working
+    "Still on it, sir.", "Nearly there, sir.",
+    # sign-offs
+    "My pleasure, sir.", "Always, sir.", "Very good, sir.", "Any time, sir.",
+    # errors
     "I didn't quite catch that, sir.",
+    # older app versions
+    "Right away, sir.", "Leave it with me.", "Consider it handled.",
 ]
 LOCK = threading.Lock()  # one conversation, one turn at a time
 
@@ -143,58 +153,205 @@ def calendar_context(url: str, days: int = 7) -> str:
 
 
 # ------------------------------------------------------------------ CLAUDE
-def ask_claude(text: str, calls: str | None, ics_url: str, _retry: bool = True) -> str:
-    claude = find_claude()
-    if not claude:
-        return "Claude Code isn't installed in my brain, sir. Run jarvis-setup in Termux again."
+def claude_env() -> dict:
+    # No API key ever: Claude Code must use the Pro plan login, never paid API credits.
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    env["PATH"] = f"{Path.home() / '.local' / 'bin'}:{env.get('PATH', '/usr/bin:/bin')}"
+    return env
+
+
+def build_prompt(text: str, calls: str | None, ics_url: str) -> str:
     now = dt.datetime.now(TZ).strftime("%A %d %B %Y, %H:%M")
     context = f"Now: {now} ({TIMEZONE})\nCalendar, next 7 days:\n{calendar_context(ics_url)}"
     if calls:
         context += f"\nRecent calls on his phone, newest first:\n{calls}"
-    prompt = f"[CONTEXT]\n{context}\n[/CONTEXT]\n\nFarhan says: {text}"
+    return f"[CONTEXT]\n{context}\n[/CONTEXT]\n\nFarhan says: {text}"
 
+
+def build_cmd(claude: str, streaming: bool) -> tuple[list[str], str]:
     cmd = [
         claude, "-p",
-        "--output-format", "json",
+        "--output-format", "stream-json" if streaming else "json",
         "--model", CLAUDE_MODEL,
         "--append-system-prompt-file", str(HERE / "persona.md"),
         "--allowedTools", "WebSearch", "WebFetch",
     ]
+    if streaming:
+        cmd += ["--verbose", "--include-partial-messages"]
     sid = SESSION_FILE.read_text().strip() if SESSION_FILE.exists() else ""
     if sid:
         cmd += ["--resume", sid]
+    return cmd, sid
 
-    # No API key ever: Claude Code must use the Pro plan login, never paid API credits.
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-    env["PATH"] = f"{Path.home() / '.local' / 'bin'}:{env.get('PATH', '/usr/bin:/bin')}"
+
+def explain_failure(detail: str) -> str:
+    low = detail.lower()
+    if "login" in low or "auth" in low:
+        return "I'm afraid I've been logged out of Claude, sir. Run jarvis-login in Termux."
+    if "limit" in low:
+        return "I've hit the Claude usage limit for now, sir. It resets in a few hours."
+    return f"I've lost the uplink, sir. {detail[:120]}"
+
+
+def ask_claude(text: str, calls: str | None, ics_url: str, _retry: bool = True) -> str:
+    """Whole answer at once. Used by older versions of the app."""
+    claude = find_claude()
+    if not claude:
+        return "Claude Code isn't installed in my brain, sir. Run jarvis-setup in Termux again."
+    cmd, sid = build_cmd(claude, streaming=False)
     try:
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                           encoding="utf-8", cwd=HERE, env=env, timeout=900)
+        r = subprocess.run(cmd, input=build_prompt(text, calls, ics_url), capture_output=True,
+                           text=True, encoding="utf-8", cwd=HERE, env=claude_env(), timeout=900)
     except subprocess.TimeoutExpired:
         return "That one took too long, sir. Try narrowing the question."
-
     try:
         data = json.loads(r.stdout)
     except json.JSONDecodeError:
         if sid and _retry:  # stale session: start fresh and try once more
             SESSION_FILE.unlink(missing_ok=True)
             return ask_claude(text, calls, ics_url, _retry=False)
-        detail = (r.stderr or r.stdout).strip()[:160]
-        if "login" in detail.lower() or "auth" in detail.lower():
-            return "I'm not logged in to Claude, sir. Run jarvis-login in Termux."
-        return f"I've lost the uplink, sir. {detail}"
-
+        return explain_failure((r.stderr or r.stdout).strip())
     if data.get("session_id"):
         SESSION_FILE.write_text(data["session_id"])
     if data.get("is_error"):
-        return f"Headquarters isn't responding, sir. {str(data.get('result', ''))[:160]}"
+        return explain_failure(str(data.get("result", "")))
     return str(data.get("result", "")).strip()
+
+
+class Sentences:
+    """Turns streamed text into whole spoken sentences, stopping at the report marker."""
+
+    MARKER = "===REPORT==="
+    END = re.compile(r"[.!?…][\"')\]]*\s")
+
+    def __init__(self, emit):
+        self.emit = emit
+        self.buf = ""
+        self.done = False
+        self.spoken: list[str] = []
+
+    def feed(self, text: str) -> None:
+        if self.done:
+            return
+        self.buf += text
+        cut = self.buf.find(self.MARKER)
+        if cut != -1:
+            self.buf = self.buf[:cut]
+            self.finish()
+            return
+        while True:
+            m = self.END.search(self.buf)
+            if not m:
+                return
+            sentence = self.buf[:m.end()]
+            if "=" in sentence:  # might be the start of the report marker; wait for more
+                return
+            self.buf = self.buf[m.end():]
+            self._say(sentence)
+
+    def finish(self) -> None:
+        if self.done:
+            return
+        rest = self.buf.split("===")[0]
+        self.buf = ""
+        self.done = True
+        self._say(rest)
+
+    def _say(self, text: str) -> None:
+        text = for_voice(text)
+        if re.search(r"\w", text):
+            self.spoken.append(text)
+            self.emit(text)
+
+
+def ask_claude_streaming(text: str, calls: str | None, ics_url: str, emit, alive=lambda: True,
+                         _retry: bool = True) -> tuple[str, str]:
+    """Speaks the answer sentence by sentence as Claude writes it. Returns (spoken, report)."""
+    claude = find_claude()
+    if not claude:
+        msg = "Claude Code isn't installed in my brain, sir. Run jarvis-setup in Termux again."
+        emit(msg)
+        return msg, ""
+    cmd, sid = build_cmd(claude, streaming=True)
+    sentences = Sentences(emit)
+    result = None
+    saw_delta = False
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+                                text=True, encoding="utf-8", cwd=HERE, env=claude_env())
+        killer = threading.Timer(900, proc.kill)
+        killer.start()
+        try:
+            proc.stdin.write(build_prompt(text, calls, ics_url))
+            proc.stdin.close()
+            for line in proc.stdout:
+                if not alive():  # he interrupted: stop thinking about the old question
+                    proc.kill()
+                    break
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                kind = ev.get("type")
+                if kind == "stream_event":
+                    e = ev.get("event") or {}
+                    if e.get("type") == "content_block_delta" and (e.get("delta") or {}).get("type") == "text_delta":
+                        saw_delta = True
+                        sentences.feed(e["delta"].get("text", ""))
+                    elif e.get("type") == "content_block_stop":
+                        sentences.feed("\n")
+                elif kind == "assistant" and not saw_delta:
+                    # Fallback if this Claude Code doesn't send partial messages.
+                    for block in (ev.get("message") or {}).get("content") or []:
+                        if block.get("type") == "text":
+                            sentences.feed(block.get("text", "") + "\n")
+                elif kind == "result":
+                    result = ev
+            proc.wait()
+        finally:
+            killer.cancel()
+        err.seek(0)
+        detail = err.read().strip()
+
+    if not alive():
+        return " ".join(sentences.spoken), ""
+    if result is None:
+        if sid and _retry and not sentences.spoken:  # stale session: start fresh, try once more
+            SESSION_FILE.unlink(missing_ok=True)
+            return ask_claude_streaming(text, calls, ics_url, emit, alive, _retry=False)
+        sentences.finish()
+        if not sentences.spoken:
+            msg = explain_failure(detail or "No answer came back.")
+            emit(msg)
+            return msg, ""
+        return " ".join(sentences.spoken), ""
+
+    if result.get("session_id"):
+        SESSION_FILE.write_text(result["session_id"])
+    full = str(result.get("result", "")).strip()
+    if result.get("is_error") and not sentences.spoken:
+        msg = explain_failure(full or detail)
+        emit(msg)
+        return msg, ""
+    spoken_part, _, report = full.partition(Sentences.MARKER)
+    sentences.finish()
+    if not sentences.spoken:  # nothing streamed: speak the final answer whole
+        sentences.done = False
+        sentences.feed(spoken_part + "\n")
+        sentences.finish()
+    return " ".join(sentences.spoken), report.strip()
 
 
 def for_voice(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[*#_`>|]", "", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def save_report(report: str) -> None:
+    if report:
+        REPORTS.mkdir(exist_ok=True)
+        (REPORTS / f"{dt.datetime.now(TZ):%Y-%m-%d_%H%M%S}.md").write_text(report, encoding="utf-8")
 
 
 # ------------------------------------------------------------------ HTTP
@@ -227,23 +384,50 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if self.path == "/say":
             return self._send(200, {"audio": synth_b64(str(data.get("text", "")))})
-        if self.path != "/ask":
+        if self.path not in ("/ask", "/ask_stream"):
             return self._send(404, {"error": "not found"})
 
         text = str(data.get("text", "")).strip()
         if not text:
             return self._send(400, {"error": "nothing was said"})
+        calls = data.get("calls")
+        ics_url = str(data.get("ics_url", "")).strip()
         print(f"> {text}", flush=True)
+
+        if self.path == "/ask":  # older app versions: whole answer at once
+            with LOCK:
+                reply = ask_claude(text, calls, ics_url)
+            spoken, _, report = reply.partition(Sentences.MARKER)
+            save_report(report.strip())
+            spoken = for_voice(spoken) or "Done, sir."
+            print(f"< {spoken}\n", flush=True)
+            return self._send(200, {"reply": spoken, "report": report.strip(), "audio": synth_b64(spoken)})
+
+        # Streaming: one JSON line per sentence, in his voice, as soon as it's ready.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        listening = [True]
+
+        def write(obj: dict) -> None:
+            if not listening[0]:
+                return
+            try:
+                self.wfile.write((json.dumps(obj) + "\n").encode())
+                self.wfile.flush()
+            except OSError:  # he interrupted; let Claude finish so the memory stays intact
+                listening[0] = False
+
+        def emit(sentence: str) -> None:
+            print(f"< {sentence}", flush=True)
+            if listening[0]:
+                write({"say": sentence, "audio": synth_b64(sentence)})
+
         with LOCK:
-            reply = ask_claude(text, data.get("calls"), str(data.get("ics_url", "")).strip())
-        spoken, _, report = reply.partition("===REPORT===")
-        report = report.strip()
-        if report:
-            REPORTS.mkdir(exist_ok=True)
-            (REPORTS / f"{dt.datetime.now(TZ):%Y-%m-%d_%H%M%S}.md").write_text(report, encoding="utf-8")
-        spoken = for_voice(spoken) or "Done, sir."
-        print(f"< {spoken}\n", flush=True)
-        self._send(200, {"reply": spoken, "report": report, "audio": synth_b64(spoken)})
+            spoken, report = ask_claude_streaming(text, calls, ics_url, emit, alive=lambda: listening[0])
+        save_report(report)
+        print(flush=True)
+        write({"done": True, "reply": spoken, "report": report})
 
     def log_message(self, *args):
         pass
