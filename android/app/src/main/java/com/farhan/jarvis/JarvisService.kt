@@ -8,9 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
-import android.media.AudioManager
 import android.media.MediaPlayer
-import android.media.ToneGenerator
+import android.media.SoundPool
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -52,6 +51,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         private val FILLERS = listOf(
             "Mm, one moment.", "Let me see.", "Right, leave it with me.", "Bear with me, sir.",
             "On it.", "Ah, let me check.", "One moment, sir.", "Allow me.",
+            "Hmm.", "Right.", "Mm, let me think.", "Good question.",
         )
         private val STILL_WORKING = listOf("Still on it, sir.", "Nearly there, sir.")
         private val SIGN_OFFS = listOf("My pleasure, sir.", "Always, sir.", "Very good, sir.", "Any time, sir.")
@@ -82,7 +82,9 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var tone: ToneGenerator? = null
+    private var chimes: SoundPool? = null
+    private var chimeWake = 0
+    private var chimeListen = 0
 
     // Conversation state
     @Volatile private var turn = 0               // bumps on every new request or interruption; stale audio is dropped
@@ -103,7 +105,18 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
-        tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 60) } catch (e: RuntimeException) { null }
+        chimes = SoundPool.Builder()
+            .setMaxStreams(2)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            .build().also {
+                chimeWake = it.load(this, R.raw.chime_wake, 1)
+                chimeListen = it.load(this, R.raw.chime_listen, 1)
+            }
         tts = TextToSpeech(this, this)
         JarvisState.update { running = true }
     }
@@ -232,10 +245,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         this.followUp = followUp
         wakeOff() // the mic can only be used by one listener at a time
         if (followUp) {
-            tone?.startTone(ToneGenerator.TONE_PROP_ACK, 60)
+            chimes?.play(chimeListen, 1f, 1f, 1, 0, 1f)
             setStatus("Listening… (just reply, no need to say Jarvis)")
         } else {
-            tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 120)
+            chimes?.play(chimeWake, 1f, 1f, 1, 0, 1f)
             setStatus("Listening…")
         }
         val myTurn = turn
@@ -254,7 +267,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 if (myTurn != turn) return
                 val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
                 when {
-                    text.isNotBlank() -> handle(text)
+                    text.isNotBlank() -> handle(text, inConversation = followUp)
                     followUp -> standBy()
                     else -> finishWith(NOT_CAUGHT)
                 }
@@ -295,7 +308,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     // ---------------------------------------------------------------- thinking
-    private fun handle(text: String) {
+    private fun handle(text: String, inConversation: Boolean = false) {
         turn++
         val myTurn = turn
         busy = true
@@ -315,7 +328,8 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
         setStatus("Thinking… (say \"Jarvis\" to cancel)")
         wakeOn() // he can still cut in with "Jarvis" while I think
-        say(Kind.FILLER, pickFiller())
+        // Mid-conversation, a person doesn't always say "hmm" first. Sometimes just answer.
+        if (!inConversation || Math.random() < 0.5) say(Kind.FILLER, pickFiller())
         main.postDelayed({
             if (myTurn == turn && !replyStarted) say(Kind.FILLER, STILL_WORKING.random())
         }, STILL_WORKING_AFTER_MS)
@@ -525,7 +539,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         recognizer?.destroy()
         stopSpeaking()
         tts?.shutdown()
-        tone?.release()
+        chimes?.release()
         worker.shutdownNow()
         voiceExec.shutdownNow()
         JarvisState.update { running = false; status = "Offline" }

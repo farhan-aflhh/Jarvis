@@ -29,13 +29,14 @@ PORT = 8765
 CLAUDE_MODEL = "sonnet"
 # His voice. British male neural voices: en-GB-RyanNeural (warm), en-GB-ThomasNeural (crisper).
 VOICE = "en-GB-RyanNeural"
-VOICE_RATE = "-4%"
-VOICE_PITCH = "-3Hz"
+VOICE_RATE = "-3%"
+VOICE_PITCH = "+0Hz"  # leave at 0: shifting pitch makes a neural voice sound processed
 
 HERE = Path(__file__).resolve().parent
 SESSION_FILE = HERE / ".session"
 REPORTS = HERE / "reports"
 CODE_FILE = HERE / "code.txt"
+MEMORY_FILE = HERE / "memory.md"  # what he's learned about you; lives only on your phone
 VOICE_CACHE = HERE / "voice_cache"
 # Short lines the app speaks itself (fillers while he thinks, sign-offs, errors).
 # Pre-recorded at startup so they play instantly. Keep in step with the app's lists.
@@ -43,6 +44,7 @@ ACKS = [
     # fillers
     "Mm, one moment.", "Let me see.", "Right, leave it with me.", "Bear with me, sir.",
     "On it.", "Ah, let me check.", "One moment, sir.", "Allow me.",
+    "Hmm.", "Right.", "Mm, let me think.", "Good question.",
     # still working
     "Still on it, sir.", "Nearly there, sir.",
     # sign-offs
@@ -160,9 +162,40 @@ def claude_env() -> dict:
     return env
 
 
+def load_memory() -> str:
+    if not MEMORY_FILE.exists():
+        return "Nothing yet."
+    lines = [l for l in MEMORY_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return "\n".join(lines[-80:]) or "Nothing yet."
+
+
+MEMORY_TAG = re.compile(r"===(REMEMBER|FORGET):\s*(.+?)===", re.S)
+
+
+def apply_memory(full_text: str) -> str:
+    """Saves ===REMEMBER: ...=== notes, drops lines for ===FORGET: ...===, and strips the tags."""
+    for kind, note in MEMORY_TAG.findall(full_text):
+        note = " ".join(note.split())
+        if not note:
+            continue
+        if kind == "REMEMBER":
+            with MEMORY_FILE.open("a", encoding="utf-8") as f:
+                f.write(f"- {dt.datetime.now(TZ):%d %b %Y}: {note}\n")
+            print(f"  (remembered: {note})", flush=True)
+        elif MEMORY_FILE.exists():
+            words = [w for w in re.findall(r"\w+", note.lower()) if len(w) > 3]
+            keep = [l for l in MEMORY_FILE.read_text(encoding="utf-8").splitlines()
+                    if not (words and all(w in l.lower() for w in words))]
+            MEMORY_FILE.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+            print(f"  (forgot: {note})", flush=True)
+    return MEMORY_TAG.sub("", full_text).strip()
+
+
 def build_prompt(text: str, calls: str | None, ics_url: str) -> str:
     now = dt.datetime.now(TZ).strftime("%A %d %B %Y, %H:%M")
-    context = f"Now: {now} ({TIMEZONE})\nCalendar, next 7 days:\n{calendar_context(ics_url)}"
+    context = (f"Now: {now} ({TIMEZONE})\n"
+               f"What you remember about him:\n{load_memory()}\n"
+               f"Calendar, next 7 days:\n{calendar_context(ics_url)}")
     if calls:
         context += f"\nRecent calls on his phone, newest first:\n{calls}"
     return f"[CONTEXT]\n{context}\n[/CONTEXT]\n\nFarhan says: {text}"
@@ -222,6 +255,7 @@ class Sentences:
     """Turns streamed text into whole spoken sentences, stopping at the report marker."""
 
     MARKER = "===REPORT==="
+    STOP = re.compile(r"===\s*(REPORT|REMEMBER|FORGET)")
     END = re.compile(r"[.!?…][\"')\]]*\s")
 
     def __init__(self, emit):
@@ -234,9 +268,9 @@ class Sentences:
         if self.done:
             return
         self.buf += text
-        cut = self.buf.find(self.MARKER)
-        if cut != -1:
-            self.buf = self.buf[:cut]
+        stop = self.STOP.search(self.buf)
+        if stop:
+            self.buf = self.buf[:stop.start()]
             self.finish()
             return
         while True:
@@ -333,6 +367,7 @@ def ask_claude_streaming(text: str, calls: str | None, ics_url: str, emit, alive
         msg = explain_failure(full or detail)
         emit(msg)
         return msg, ""
+    full = apply_memory(full)
     spoken_part, _, report = full.partition(Sentences.MARKER)
     sentences.finish()
     if not sentences.spoken:  # nothing streamed: speak the final answer whole
@@ -396,7 +431,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/ask":  # older app versions: whole answer at once
             with LOCK:
-                reply = ask_claude(text, calls, ics_url)
+                reply = apply_memory(ask_claude(text, calls, ics_url))
             spoken, _, report = reply.partition(Sentences.MARKER)
             save_report(report.strip())
             spoken = for_voice(spoken) or "Done, sir."
@@ -418,13 +453,40 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:  # he interrupted; let Claude finish so the memory stays intact
                 listening[0] = False
 
+        # The first sentence is voiced on its own so he starts talking quickly. Sentences that
+        # arrive while a voice clip is being made are joined, so they flow as one breath.
+        pending: list[str] = []
+        cond = threading.Condition()
+        finished = [False]
+
         def emit(sentence: str) -> None:
             print(f"< {sentence}", flush=True)
-            if listening[0]:
-                write({"say": sentence, "audio": synth_b64(sentence)})
+            with cond:
+                pending.append(sentence)
+                cond.notify()
 
-        with LOCK:
-            spoken, report = ask_claude_streaming(text, calls, ics_url, emit, alive=lambda: listening[0])
+        def voicer() -> None:
+            while True:
+                with cond:
+                    while not pending and not finished[0]:
+                        cond.wait()
+                    if not pending and finished[0]:
+                        return
+                    batch = " ".join(pending)
+                    pending.clear()
+                if listening[0]:
+                    write({"say": batch, "audio": synth_b64(batch)})
+
+        voice_thread = threading.Thread(target=voicer, daemon=True)
+        voice_thread.start()
+        try:
+            with LOCK:
+                spoken, report = ask_claude_streaming(text, calls, ics_url, emit, alive=lambda: listening[0])
+        finally:
+            with cond:
+                finished[0] = True
+                cond.notify()
+            voice_thread.join()
         save_report(report)
         print(flush=True)
         write({"done": True, "reply": spoken, "report": report})
