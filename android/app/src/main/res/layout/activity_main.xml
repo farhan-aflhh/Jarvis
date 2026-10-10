@@ -188,12 +188,6 @@
             android:visibility="gone">
 
             <EditText
-                android:id="@+id/accessKey"
-                style="@style/Field"
-                android:hint="Picovoice AccessKey (for the wake word)"
-                android:inputType="textNoSuggestions" />
-
-            <EditText
                 android:id="@+id/brainCode"
                 style="@style/Field"
                 android:hint="Brain code (shown in Termux)"

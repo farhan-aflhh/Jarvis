@@ -23,9 +23,6 @@ import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
-import ai.picovoice.porcupine.Porcupine
-import ai.picovoice.porcupine.PorcupineException
-import ai.picovoice.porcupine.PorcupineManager
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -77,8 +74,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private val worker = Executors.newSingleThreadExecutor()
     private val voiceExec = Executors.newSingleThreadExecutor() // gets his voice, strictly in order
     private lateinit var prefs: Prefs
-    private var porcupine: PorcupineManager? = null
-    private var wakeActive = false
+    private var wakeWord: WakeWord? = null
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -154,7 +150,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         val n = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_jarvis)
             .setContentTitle("Jarvis is standing by")
-            .setContentText("Say \"Jarvis\"")
+            .setContentText("Say \"Hey Jarvis\"")
             .setOngoing(true)
             .setContentIntent(open)
             .build()
@@ -170,59 +166,41 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     // ---------------------------------------------------------------- wake word
     private fun ensureWakeWord(): Boolean {
-        if (porcupine != null) return true
-        val key = prefs.accessKey
-        if (key.isBlank()) {
-            setStatus("Ready. Add your Picovoice AccessKey in settings for the wake word.")
-            return false
-        }
+        if (wakeWord != null) return true
         return try {
-            porcupine = PorcupineManager.Builder()
-                .setAccessKey(key)
-                .setKeyword(Porcupine.BuiltInKeyword.JARVIS)
-                .setSensitivity(0.6f)
-                .setErrorCallback { e -> setStatus("Wake word error: ${e.message}") }
-                .build(applicationContext) { _ -> main.post { onWake() } }
+            wakeWord = WakeWord(applicationContext) { main.post { onWake() } }
             true
-        } catch (e: PorcupineException) {
-            setStatus("Wake word couldn't start: ${e.message}")
+        } catch (e: Exception) {
+            setStatus("Wake word couldn't load: ${e.message}")
             false
         }
     }
 
     private fun wakeOn(): Boolean {
-        if (wakeActive) return true
         if (!ensureWakeWord()) return false
-        return try {
-            porcupine?.start()
-            wakeActive = true
-            true
-        } catch (e: PorcupineException) {
-            setStatus("Wake word couldn't start: ${e.message}")
-            false
+        val w = wakeWord ?: return false
+        if (w.isRunning) return true
+        if (!w.start()) {
+            setStatus("Couldn't open the microphone for the wake word. Check Jarvis has microphone permission.")
+            return false
         }
+        return true
     }
 
     private fun wakeOff() {
-        if (!wakeActive) return
-        try {
-            porcupine?.stop()
-        } catch (_: PorcupineException) {
-        }
-        wakeActive = false
+        wakeWord?.stop()
     }
 
     private fun releaseWakeWord() {
-        wakeOff()
-        porcupine?.delete()
-        porcupine = null
+        wakeWord?.release()
+        wakeWord = null
     }
 
     /** Back to waiting for "Jarvis". */
     private fun standBy() {
         busy = false
         followUp = false
-        if (wakeOn()) setStatus("Standing by. Say \"Jarvis\".")
+        if (wakeOn()) setStatus("Standing by. Say \"Hey Jarvis\".")
     }
 
     private fun onWake() {

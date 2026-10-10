@@ -11,8 +11,12 @@ android {
         applicationId = "com.farhan.jarvis"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.4"
+        versionCode = 6
+        versionName = "1.5"
+        // Modern phones only: keeps the app small (the wake word engine is a big library).
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     // A fixed key so new builds install over old ones without uninstalling.
@@ -40,5 +44,5 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
-    implementation("ai.picovoice:porcupine-android:4.0.2")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }

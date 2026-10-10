@@ -54,12 +54,10 @@ class MainActivity : Activity() {
         }
         input = findViewById(R.id.input)
 
-        val accessKey = findViewById<EditText>(R.id.accessKey)
         val brainCode = findViewById<EditText>(R.id.brainCode)
         val icsUrl = findViewById<EditText>(R.id.icsUrl)
         val settings = findViewById<View>(R.id.settings)
         val settingsToggle = findViewById<TextView>(R.id.settingsToggle)
-        accessKey.setText(prefs.accessKey)
         brainCode.setText(prefs.brainCode)
         icsUrl.setText(prefs.icsUrl)
 
@@ -94,7 +92,6 @@ class MainActivity : Activity() {
             settingsToggle.text = if (show) "SETTINGS  ▴" else "SETTINGS  ▾"
         }
         findViewById<Button>(R.id.save).setOnClickListener {
-            prefs.accessKey = accessKey.text.toString()
             prefs.brainCode = brainCode.text.toString()
             prefs.icsUrl = icsUrl.text.toString()
             if (JarvisState.running) JarvisService.send(this, JarvisService.ACTION_RELOAD)
